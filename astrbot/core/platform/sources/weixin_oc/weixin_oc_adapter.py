@@ -102,6 +102,9 @@ class WeixinOCReplyMeta:
 )
 class WeixinOCAdapter(Platform):
     SESSION_TIMEOUT_ERRCODE = -14
+    PREPARE_FAILED_RET = -2
+    PREPARE_FAILED_MESSAGE = "prepare failed"
+    SEND_PREPARE_RETRY_DELAYS_S = (1, 3)
     IMAGE_ITEM_TYPE = 2
     VOICE_ITEM_TYPE = 3
     FILE_ITEM_TYPE = 4
@@ -891,26 +894,50 @@ class WeixinOCAdapter(Platform):
                 user_id,
             )
             return False
-        payload = await self.client.request_json(
-            "POST",
-            "ilink/bot/sendmessage",
-            payload={
-                "base_info": {
-                    "channel_version": "astrbot",
-                },
-                "msg": {
-                    "from_user_id": "",
-                    "to_user_id": user_id,
-                    "client_id": uuid.uuid4().hex,
-                    "message_type": 2,
-                    "message_state": 2,
-                    "context_token": context_token,
-                    "item_list": item_list,
-                },
+        request_payload = {
+            "base_info": {
+                "channel_version": "astrbot",
             },
-            token_required=True,
-            headers={},
-        )
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": user_id,
+                "client_id": uuid.uuid4().hex,
+                "message_type": 2,
+                "message_state": 2,
+                "context_token": context_token,
+                "item_list": item_list,
+            },
+        }
+        payload: dict[str, Any] = {}
+        for attempt in range(len(self.SEND_PREPARE_RETRY_DELAYS_S) + 1):
+            payload = await self.client.request_json(
+                "POST",
+                "ilink/bot/sendmessage",
+                payload=request_payload,
+                token_required=True,
+                headers={},
+            )
+            if self._is_successful_api_payload(payload):
+                break
+            is_prepare_failure = (
+                int(payload.get("ret") or 0) == self.PREPARE_FAILED_RET
+                and str(payload.get("errmsg", "")).strip().lower()
+                == self.PREPARE_FAILED_MESSAGE
+            )
+            if not is_prepare_failure or attempt >= len(
+                self.SEND_PREPARE_RETRY_DELAYS_S
+            ):
+                break
+            retry_delay = self.SEND_PREPARE_RETRY_DELAYS_S[attempt]
+            logger.warning(
+                "weixin_oc(%s): sendmessage prepare failed for %s, retrying in %ss (%s/%s)",
+                self.meta().id,
+                user_id,
+                retry_delay,
+                attempt + 1,
+                len(self.SEND_PREPARE_RETRY_DELAYS_S),
+            )
+            await asyncio.sleep(retry_delay)
         if not self._is_successful_api_payload(payload):
             logger.warning(
                 "weixin_oc(%s): sendmessage failed for %s: %s",
